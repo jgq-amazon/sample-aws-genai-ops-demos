@@ -2,12 +2,17 @@ import { useState, useRef, useEffect } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
-import Input from "@cloudscape-design/components/input";
 import Button from "@cloudscape-design/components/button";
 import Box from "@cloudscape-design/components/box";
 import Alert from "@cloudscape-design/components/alert";
+import FormField from "@cloudscape-design/components/form-field";
+import LiveRegion from "@cloudscape-design/components/live-region";
 import Popover from "@cloudscape-design/components/popover";
+import PromptInput from "@cloudscape-design/components/prompt-input";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import Avatar from "@cloudscape-design/chat-components/avatar";
+import ChatBubble from "@cloudscape-design/chat-components/chat-bubble";
+import SupportPromptGroup from "@cloudscape-design/chat-components/support-prompt-group";
 import MessageBubble from "./MessageBubble";
 import ErrorBoundary from "./ErrorBoundary";
 import {
@@ -25,8 +30,16 @@ const GREETING_BODY =
   "- **Generate** — create least-privilege policies from actual usage\n" +
   "- **Protect** — validate changes, assess blast radius before you act\n\n" +
   "Click a suggestion below to get started, or ask anything in your own words.\n\n" +
-  "*Tip: Anything I generate can be saved to S3 — just say \"export that\".*\n\n" +
-  "🔒 **Read-only** — this assistant analyzes and recommends but never modifies your IAM roles, policies, or configurations.";
+  "*Tip: Anything I generate can be saved to S3 — just say \"export that\".*";
+
+// Read-only disclaimer moved to the composer's FormField constraintText per
+// Cloudscape's disclaimer pattern (Cloudscape gen-AI chat › "Under the prompt
+// input, use FormField constraint text for constraint content that applies
+// to the entire chat"). The pre-existing 🔒 glyph + prose inside the
+// welcome bubble is removed here (#167 Req 3.4, Req 8.5) — the constraint
+// message below carries the same information in the right place.
+const COMPOSER_DISCLAIMER =
+  "Read-only assistant — analyzes and recommends. Never modifies IAM roles, policies, or configurations.";
 
 /**
  * Compose the welcome bubble from the greeting plus the session-start
@@ -49,6 +62,22 @@ interface ActivityEntry {
 
 type AssistantMode = "guided" | "quick";
 
+/**
+ * Suggested prompts rendered as a Cloudscape <SupportPromptGroup> below the
+ * transcript on session start. Each item's `id` is the full prompt text
+ * sent to the backend when clicked; the `text` is the short label the user
+ * sees on the pill.
+ */
+const SUGGESTED_PROMPTS: Array<{ id: string; text: string }> = [
+  { text: "Guided tour", id: "Take me on a guided tour of my IAM security posture — walk me through step by step" },
+  { text: "Show my findings", id: "What are my active IAM findings?" },
+  { text: "Prioritized action plan", id: "Generate a prioritized action plan for my IAM findings" },
+  { text: "Blast radius check", id: "What's the blast radius if I delete my most critical unused role?" },
+  { text: "Build a policy", id: "Help me create a least-privilege policy for a new workload I'm building" },
+  { text: "Compare roles", id: "Compare the risk profile of my top 3 unused roles" },
+  { text: "Practice exercise", id: "Give me a practice exercise — show me an overly permissive policy and teach me what's wrong with it" },
+];
+
 const TIMEOUT_ADVICE =
   "That request ran past the API gateway's 29-second limit before finishing. " +
   "Break it into smaller steps (for example, `show my active findings`, then `generate an action plan` on its own), " +
@@ -63,6 +92,10 @@ export default function ChatInterface() {
   const [sessionActivity, setSessionActivity] = useState<ActivityEntry[]>([]);
   const [mode, setMode] = useState<AssistantMode>("guided");
   const [sessionTokens, setSessionTokens] = useState({ input: 0, output: 0 });
+  // Announcement text for the <LiveRegion> below. Screen readers re-announce
+  // whenever this string changes — used to signal "Generating a response"
+  // on request start and the plain-text response body on request end.
+  const [liveAnnouncement, setLiveAnnouncement] = useState("");
   // Use a ref so the current pagination cursor is read synchronously on the
   // next send, without a re-render round trip.
   const paginationRef = useRef<PaginationContext | null>(null);
@@ -107,6 +140,8 @@ export default function ChatInterface() {
     setInputValue("");
     setIsLoading(true);
     setError(null);
+    // Announce request start to screen readers via the <LiveRegion>.
+    setLiveAnnouncement("Generating a response");
 
     try {
       // The welcome bubble is always messages[0] and belongs to the UI, not
@@ -137,7 +172,8 @@ export default function ChatInterface() {
         setSessionActivity((prev) => [...prev, ...newActivities]);
       }
 
-      // Show tools used as a subtle indicator
+      // Show tools used as a subtle indicator (#167 Req 5 will replace this
+      // with an <ExpandableSection variant="inline"> + <Steps> in PR 3).
       let toolsPrefix = "";
       if (response.tools_used && response.tools_used.length > 0) {
         const toolNames = response.tools_used
@@ -152,6 +188,11 @@ export default function ChatInterface() {
         usage: response.usage,
       };
       setMessages((prev) => [...prev, assistantMessage]);
+      // Announce the response body to screen readers. Strip markdown emphasis
+      // markers so the announcement reads as plain text, not "star star word
+      // star star". Cap the announced length so a long response doesn't lock
+      // the AT into a multi-minute readback.
+      setLiveAnnouncement(announceableText(response.response));
 
       if (response.usage) {
         setSessionTokens((prev) => ({
@@ -168,6 +209,7 @@ export default function ChatInterface() {
         content: isTimeout ? errorMsg : `I encountered an error: ${errorMsg}\n\nPlease try again or rephrase your question.`,
       };
       setMessages((prev) => [...prev, assistantMessage]);
+      setLiveAnnouncement(errorMsg);
     } finally {
       setIsLoading(false);
     }
@@ -178,6 +220,7 @@ export default function ChatInterface() {
     setSessionActivity([]);
     setError(null);
     paginationRef.current = null;
+    setLiveAnnouncement("");
   };
 
   return (
@@ -200,7 +243,8 @@ export default function ChatInterface() {
       }
     >
       <SpaceBetween size="m">
-        {/* Mode toggle */}
+        {/* Mode toggle — PR 4 will replace this hand-rolled div with a
+            Cloudscape <SegmentedControl> in the Header actions slot. */}
         <div
           style={{
             display: "flex",
@@ -225,22 +269,27 @@ export default function ChatInterface() {
           </Button>
         </div>
 
+        {/* Error alert — PR 4 will consolidate this and the in-transcript
+            error bubble into a single inline <Alert> with a Try again
+            action, per #167 Req 7. */}
         {error && (
           <Alert type="error" dismissible onDismiss={() => setError(null)}>
             {error}
           </Alert>
         )}
 
-        {capabilities && (
-          <DataSourcesStatus capabilities={capabilities} />
-        )}
+        {capabilities && <DataSourcesStatus capabilities={capabilities} />}
 
         {sessionActivity.length > 0 && (
           <SessionActivityBar activities={sessionActivity} tokens={sessionTokens} />
         )}
 
-        {/* Message history */}
+        {/* Transcript with accessibility landmark. Screen readers get a
+            "Chat" region with all messages inside, so users can navigate
+            in and out with landmark shortcuts. */}
         <div
+          role="region"
+          aria-label="Chat"
           style={{
             maxHeight: "60vh",
             overflowY: "auto",
@@ -253,147 +302,94 @@ export default function ChatInterface() {
                 <MessageBubble message={message} />
               </ErrorBoundary>
             ))}
-            {isLoading && (
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "flex-start",
-                  padding: "4px 0",
-                }}
-              >
-                <div
-                  style={{
-                    padding: "12px 16px",
-                    borderRadius: "12px",
-                    backgroundColor: "var(--color-background-container-content)",
-                    border: "1px solid var(--color-border-divider-default)",
-                  }}
-                >
-                  <Box color="text-body-secondary">
-                    <LoadingDots />
-                  </Box>
-                </div>
-              </div>
-            )}
+            {isLoading && <LoadingBubble />}
             <div ref={messagesEndRef} />
           </SpaceBetween>
         </div>
 
-        {/* Suggested prompts — show only at start */}
+        {/* Suggested prompts — Cloudscape <SupportPromptGroup>, session
+            start only (#167 Req 3.3). */}
         {messages.length <= 1 && !isLoading && (
-          <SuggestedPrompts onSelect={(prompt) => handleSend(prompt)} />
+          <SupportPromptGroup
+            ariaLabel="Suggested questions"
+            alignment="horizontal"
+            items={SUGGESTED_PROMPTS}
+            onItemClick={({ detail }) => handleSend(detail.id)}
+          />
         )}
 
-        {/* Input area */}
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSend();
-          }}
-          style={{ display: "flex", gap: "8px" }}
-        >
-          <div style={{ flex: 1 }}>
-            <Input
-              value={inputValue}
-              onChange={({ detail }) => setInputValue(detail.value)}
-              placeholder="Ask about a role, finding, or policy…"
-              disabled={isLoading}
-            />
-          </div>
-          <Button
-            variant="primary"
-            formAction="submit"
-            onClick={() => handleSend()}
-            disabled={!inputValue.trim() || isLoading}
-            iconName="send"
-          >
-            Send
-          </Button>
-        </form>
+        {/* Composer with disclaimer as constraint text (#167 Req 3.1, 3.4).
+            PromptInput handles Enter-to-send, the send button icon, and
+            multi-line growth. */}
+        <FormField constraintText={COMPOSER_DISCLAIMER}>
+          <PromptInput
+            value={inputValue}
+            onChange={({ detail }) => setInputValue(detail.value)}
+            onAction={() => handleSend()}
+            actionButtonIconName="send"
+            actionButtonAriaLabel="Send message"
+            placeholder="Ask a question"
+            disabled={isLoading}
+            minRows={1}
+            maxRows={4}
+            ariaLabel="Ask the generative AI assistant a question"
+          />
+        </FormField>
       </SpaceBetween>
+
+      {/* Visually hidden live region for screen-reader announcements
+          (#167 Req 4.2, 4.3). Cloudscape's <LiveRegion> re-announces
+          whenever its rendered children change; we drive it from a
+          single state string so start/end announcements are serialized. */}
+      <LiveRegion hidden>{liveAnnouncement}</LiveRegion>
     </Container>
   );
 }
 
 // --- Sub-components ---
 
-function SuggestedPrompts({ onSelect }: { onSelect: (prompt: string) => void }) {
-  const prompts = [
-    { label: "Guided tour", value: "Take me on a guided tour of my IAM security posture — walk me through step by step" },
-    { label: "Show my findings", value: "What are my active IAM findings?" },
-    {
-      label: "Prioritized action plan",
-      value: "Generate a prioritized action plan for my IAM findings",
-    },
-    {
-      label: "Blast radius check",
-      value: "What's the blast radius if I delete my most critical unused role?",
-    },
-    {
-      label: "Build a policy",
-      value: "Help me create a least-privilege policy for a new workload I'm building",
-    },
-    {
-      label: "Compare roles",
-      value: "Compare the risk profile of my top 3 unused roles",
-    },
-    {
-      label: "Practice exercise",
-      value: "Give me a practice exercise — show me an overly permissive policy and teach me what's wrong with it",
-    },
-  ];
-
+/**
+ * Placeholder assistant bubble shown while a request is in flight. Uses the
+ * standard Cloudscape gen-AI loading pattern: an incoming <ChatBubble> whose
+ * <Avatar> is in the loading state, with visible copy so sighted users see
+ * that something is happening. The <LiveRegion> mounted alongside handles
+ * the AT announcement.
+ */
+function LoadingBubble() {
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-      {prompts.map((p) => (
-        <Button key={p.label} variant="normal" onClick={() => onSelect(p.value)}>
-          {p.label}
-        </Button>
-      ))}
-    </div>
+    <ChatBubble
+      type="incoming"
+      showLoadingBar
+      avatar={
+        <Avatar
+          iconName="gen-ai"
+          color="gen-ai"
+          loading
+          ariaLabel="Generative AI assistant thinking"
+        />
+      }
+      ariaLabel="Assistant is generating a response"
+    >
+      <Box color="text-body-secondary">Generating a response</Box>
+    </ChatBubble>
   );
 }
 
-function SessionActivityBar({ activities, tokens }: { activities: ActivityEntry[]; tokens: { input: number; output: number } }) {
-  const toolCounts: Record<string, number> = {};
-  for (const a of activities) {
-    const name = a.tool.replace(/_/g, " ");
-    toolCounts[name] = (toolCounts[name] || 0) + 1;
-  }
-
-  // Approximate cost: Claude Sonnet input $3/MTok, output $15/MTok
-  const estimatedCost = (tokens.input * 3 + tokens.output * 15) / 1_000_000;
-  const costDisplay = estimatedCost < 0.01 ? "<$0.01" : `~$${estimatedCost.toFixed(3)}`;
-
-  return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        padding: "8px 12px",
-        backgroundColor: "var(--color-background-status-info)",
-        borderRadius: "8px",
-        border: "1px solid var(--color-border-status-info)",
-        fontSize: "12px",
-        color: "var(--color-text-status-info)",
-      }}
-    >
-      <span>
-        <strong>Session:</strong>{" "}
-        {Object.entries(toolCounts)
-          .map(([name, count]) => `${name} (${count}x)`)
-          .join(" | ")}
-        {" — "}
-        {activities.length} tool call{activities.length !== 1 ? "s" : ""}
-      </span>
-      <span style={{ opacity: 0.8 }}>
-        {tokens.input + tokens.output > 0 && (
-          <>Tokens: {(tokens.input + tokens.output).toLocaleString()} | Cost: {costDisplay}</>
-        )}
-      </span>
-    </div>
-  );
+/**
+ * Strip markdown emphasis and cap length so the <LiveRegion> announcement
+ * reads as natural language. Screen readers otherwise pronounce `**bold**`
+ * as "star star bold star star".
+ */
+function announceableText(raw: string): string {
+  const stripped = raw
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/^\s*#{1,6}\s+/gm, "")
+    .trim();
+  const MAX = 600;
+  return stripped.length > MAX ? `${stripped.slice(0, MAX)}. Response continues.` : stripped;
 }
 
 /**
@@ -483,21 +479,44 @@ function DataSourcesStatus({ capabilities }: { capabilities: Capabilities }) {
   );
 }
 
-function LoadingDots() {
+function SessionActivityBar({ activities, tokens }: { activities: ActivityEntry[]; tokens: { input: number; output: number } }) {
+  const toolCounts: Record<string, number> = {};
+  for (const a of activities) {
+    const name = a.tool.replace(/_/g, " ");
+    toolCounts[name] = (toolCounts[name] || 0) + 1;
+  }
+
+  // Approximate cost: Claude Sonnet input $3/MTok, output $15/MTok
+  const estimatedCost = (tokens.input * 3 + tokens.output * 15) / 1_000_000;
+  const costDisplay = estimatedCost < 0.01 ? "<$0.01" : `~$${estimatedCost.toFixed(3)}`;
+
   return (
-    <span style={{ display: "inline-flex", gap: "4px", alignItems: "center" }}>
-      <span>Analyzing</span>
-      <span className="loading-dots">
-        <span style={{ animation: "pulse 1.4s infinite", animationDelay: "0s" }}>.</span>
-        <span style={{ animation: "pulse 1.4s infinite", animationDelay: "0.2s" }}>.</span>
-        <span style={{ animation: "pulse 1.4s infinite", animationDelay: "0.4s" }}>.</span>
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        padding: "8px 12px",
+        backgroundColor: "var(--color-background-status-info)",
+        borderRadius: "8px",
+        border: "1px solid var(--color-border-status-info)",
+        fontSize: "12px",
+        color: "var(--color-text-status-info)",
+      }}
+    >
+      <span>
+        <strong>Session:</strong>{" "}
+        {Object.entries(toolCounts)
+          .map(([name, count]) => `${name} (${count}x)`)
+          .join(" | ")}
+        {" — "}
+        {activities.length} tool call{activities.length !== 1 ? "s" : ""}
       </span>
-      <style>{`
-        @keyframes pulse {
-          0%, 80%, 100% { opacity: 0.3; }
-          40% { opacity: 1; }
-        }
-      `}</style>
-    </span>
+      <span style={{ opacity: 0.8 }}>
+        {tokens.input + tokens.output > 0 && (
+          <>Tokens: {(tokens.input + tokens.output).toLocaleString()} | Cost: {costDisplay}</>
+        )}
+      </span>
+    </div>
   );
 }

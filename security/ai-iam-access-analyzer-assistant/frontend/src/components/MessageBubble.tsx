@@ -2,6 +2,8 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Link from "@cloudscape-design/components/link";
 import SpaceBetween from "@cloudscape-design/components/space-between";
+import Avatar from "@cloudscape-design/chat-components/avatar";
+import ChatBubble from "@cloudscape-design/chat-components/chat-bubble";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
@@ -79,92 +81,109 @@ const MARKDOWN_COMPONENTS: Components = {
 export default function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === "user";
 
-  if (isUser) {
-    return (
-      <div style={{ display: "flex", justifyContent: "flex-end", padding: "4px 0" }}>
-        <div
-          style={{
-            maxWidth: "75%",
-            padding: "12px 16px",
-            borderRadius: "12px",
-            backgroundColor: "var(--color-background-button-primary-default)",
-            color: "var(--color-text-button-primary-default, #ffffff)",
-          }}
-        >
-          <Box variant="p">
-            <span style={{ whiteSpace: "pre-wrap", lineHeight: "1.5", color: "inherit" }}>
-              {message.content}
-            </span>
-          </Box>
-        </div>
-      </div>
-    );
-  }
+  // Cloudscape chat pattern: EVERY message renders in a <ChatBubble> with
+  // an <Avatar> as the authorship cue. The embedded pattern the AWS
+  // console uses for assistants inside an <AppLayout> content area is
+  // one-sided (all bubbles left-aligned); alternating left/right without
+  // avatars is a hybrid the pattern explicitly warns against (#167 Req 2).
+  const avatar = isUser ? (
+    // Initials-based user avatars require the Cognito email or display
+    // name to be fetched at mount time. That plumbing is a small follow-up;
+    // for this PR the fallback icon avatar named by #167 Req 2.3 is used.
+    <Avatar iconName="user-profile" tooltipText="You" ariaLabel="Your message" />
+  ) : (
+    <Avatar
+      iconName="gen-ai"
+      color="gen-ai"
+      tooltipText="Generative AI assistant"
+      ariaLabel="Generative AI assistant response"
+    />
+  );
 
-  // Assistant message — detect structured content
+  return (
+    <ChatBubble
+      type={isUser ? "outgoing" : "incoming"}
+      avatar={avatar}
+      ariaLabel={isUser ? "Your message" : "Generative AI assistant response"}
+    >
+      {isUser ? (
+        // User content is plain text; render as a paragraph with preserved
+        // whitespace (so line breaks the user typed survive).
+        <Box variant="p">
+          <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
+            {message.content}
+          </span>
+        </Box>
+      ) : (
+        // Assistant content is parsed into sections: text (markdown),
+        // policy documents (JSON), findings tables, dependency graphs.
+        // The section renderers are unchanged from the prior surface.
+        <AssistantSections message={message} />
+      )}
+    </ChatBubble>
+  );
+}
+
+function AssistantSections({ message }: { message: Message }) {
   const sections = parseAssistantMessage(message.content);
 
   return (
-    <div style={{ display: "flex", justifyContent: "flex-start", padding: "4px 0" }}>
-      <div style={{ maxWidth: "90%", width: "100%" }}>
-        <SpaceBetween size="s">
-          {sections.map((section, index) => {
-            switch (section.type) {
-              case "policy":
-                return (
-                  <PolicyViewer
-                    key={index}
-                    policy={section.content}
-                    title={section.title}
-                    reductionMetrics={section.metrics}
-                  />
-                );
-              case "findings":
-                return (
-                  <FindingsTable
-                    key={index}
-                    findings={section.findings}
-                    summary={section.summary}
-                  />
-                );
-              case "dependencies":
-                return (
-                  <DependencyGraph key={index} data={section.data} />
-                );
-              case "text":
-              default:
-                return (
+    <SpaceBetween size="s">
+      {sections.map((section, index) => {
+        switch (section.type) {
+          case "policy":
+            return (
+              <PolicyViewer
+                key={index}
+                policy={section.content}
+                title={section.title}
+                reductionMetrics={section.metrics}
+              />
+            );
+          case "findings":
+            return (
+              <FindingsTable
+                key={index}
+                findings={section.findings}
+                summary={section.summary}
+              />
+            );
+          case "dependencies":
+            return <DependencyGraph key={index} data={section.data} />;
+          case "text":
+          default:
+            return (
+              <div
+                key={index}
+                style={{
+                  color: "var(--color-text-body-default)",
+                  lineHeight: 1.6,
+                }}
+              >
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeSanitize]}
+                  components={MARKDOWN_COMPONENTS}
+                >
+                  {section.content}
+                </ReactMarkdown>
+                {section.content.length > 200 && (
                   <div
-                    key={index}
                     style={{
-                      padding: "12px 16px",
-                      borderRadius: "12px",
-                      backgroundColor: "var(--color-background-container-content)",
-                      color: "var(--color-text-body-default)",
-                      border: "1px solid var(--color-border-divider-default)",
-                      position: "relative",
-                      lineHeight: 1.6,
+                      marginTop: "8px",
+                      borderTop:
+                        "1px solid var(--color-border-divider-default)",
+                      paddingTop: "8px",
                     }}
                   >
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[rehypeSanitize]}
-                      components={MARKDOWN_COMPONENTS}
-                    >
-                      {section.content}
-                    </ReactMarkdown>
-                    {section.content.length > 200 && (
-                      <div style={{ marginTop: "8px", borderTop: "1px solid var(--color-border-divider-default)", paddingTop: "8px" }}>
-                        <DownloadButton content={message.content} />
-                      </div>
-                    )}
+                    <DownloadButton content={message.content} />
                   </div>
-                );
-            }
-          })}
-        </SpaceBetween>
-      </div>
-    </div>
+                )}
+              </div>
+            );
+        }
+      })}
+    </SpaceBetween>
   );
 }
 
