@@ -142,6 +142,14 @@ export default function ChatInterface() {
     setError(null);
     // Announce request start to screen readers via the <LiveRegion>.
     setLiveAnnouncement("Generating a response");
+    // Client-side request-duration measurement — used by the Thinking
+    // pattern's ExpandableSection header ("Thought for Ns"). This is a
+    // wall-clock measurement, so it includes network latency to API
+    // Gateway plus the backend Lambda's full turn. The backend does not
+    // currently return a server-side elapsed time; if it starts to, we
+    // switch to that value here (it would be more accurate for the
+    // "how long did the model think" question).
+    const startTime = performance.now();
 
     try {
       // The welcome bubble is always messages[0] and belongs to the UI, not
@@ -158,6 +166,11 @@ export default function ChatInterface() {
         paginationRef.current
       );
 
+      const durationSeconds = Math.max(
+        1,
+        Math.round((performance.now() - startTime) / 1000)
+      );
+
       // Persist pagination cursor for deterministic follow-ups like "next 20".
       // Clear it when the server did not return one so a later, unrelated turn
       // doesn't accidentally continue paging the wrong list.
@@ -172,20 +185,19 @@ export default function ChatInterface() {
         setSessionActivity((prev) => [...prev, ...newActivities]);
       }
 
-      // Show tools used as a subtle indicator (#167 Req 5 will replace this
-      // with an <ExpandableSection variant="inline"> + <Steps> in PR 3).
-      let toolsPrefix = "";
-      if (response.tools_used && response.tools_used.length > 0) {
-        const toolNames = response.tools_used
-          .map((t) => t.tool.replace(/_/g, " "))
-          .join(", ");
-        toolsPrefix = `*Used: ${toolNames}*\n\n`;
-      }
-
+      // Tools_used and duration ride ON the Message object now (per #167
+      // Req 5). The old `*Used: tool1, tool2*` markdown prefix that used
+      // to be concatenated into the response text is gone — MessageBubble
+      // renders a Cloudscape ExpandableSection + Steps for these fields.
       const assistantMessage: Message = {
         role: "assistant",
-        content: toolsPrefix + response.response,
+        content: response.response,
         usage: response.usage,
+        toolsUsed: response.tools_used?.map((t) => ({
+          tool: t.tool,
+          input_summary: t.input_summary,
+        })),
+        durationSeconds,
       };
       setMessages((prev) => [...prev, assistantMessage]);
       // Announce the response body to screen readers. Strip markdown emphasis
@@ -221,6 +233,21 @@ export default function ChatInterface() {
     setError(null);
     paginationRef.current = null;
     setLiveAnnouncement("");
+  };
+
+  /**
+   * Toggle the helpful / not-helpful feedback flag on a specific message.
+   * Clicking the same option twice clears the vote. Local-only state per
+   * #167 spec DD-4 — no server telemetry endpoint is called.
+   */
+  const handleFeedback = (index: number, feedback: "helpful" | "not-helpful") => {
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === index
+          ? { ...m, feedback: m.feedback === feedback ? undefined : feedback }
+          : m
+      )
+    );
   };
 
   return (
@@ -299,7 +326,14 @@ export default function ChatInterface() {
           <SpaceBetween size="s">
             {messages.map((message, index) => (
               <ErrorBoundary key={index}>
-                <MessageBubble message={message} />
+                <MessageBubble
+                  message={message}
+                  onFeedback={
+                    message.role === "assistant" && index > 0
+                      ? (fb) => handleFeedback(index, fb)
+                      : undefined
+                  }
+                />
               </ErrorBoundary>
             ))}
             {isLoading && <LoadingBubble />}

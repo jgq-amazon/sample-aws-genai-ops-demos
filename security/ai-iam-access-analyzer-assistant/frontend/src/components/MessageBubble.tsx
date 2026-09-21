@@ -1,7 +1,10 @@
 import Box from "@cloudscape-design/components/box";
-import Button from "@cloudscape-design/components/button";
+import ButtonGroup from "@cloudscape-design/components/button-group";
+import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import Link from "@cloudscape-design/components/link";
 import SpaceBetween from "@cloudscape-design/components/space-between";
+import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import Steps from "@cloudscape-design/components/steps";
 import Avatar from "@cloudscape-design/chat-components/avatar";
 import ChatBubble from "@cloudscape-design/chat-components/chat-bubble";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -14,6 +17,12 @@ import { Message, Finding, DependencyResult } from "../types";
 
 interface MessageBubbleProps {
   message: Message;
+  /**
+   * Called when the user toggles the Helpful / Not helpful vote on this
+   * response. Ignored for user messages and the UI-generated welcome
+   * bubble. Local-only state per #167 spec DD-4 — no server telemetry.
+   */
+  onFeedback?: (feedback: "helpful" | "not-helpful") => void;
 }
 
 /**
@@ -33,10 +42,6 @@ interface MessageBubbleProps {
  * model reflects back) cannot inject executable HTML.
  */
 const MARKDOWN_COMPONENTS: Components = {
-  // Links: external http(s) URLs open in a new tab with rel=noopener
-  // noreferrer (both to prevent reverse-tabnabbing and to keep referer
-  // headers off the third party). Non-http links (e.g. `#anchor`,
-  // `mailto:`) render as inline Cloudscape links that stay in the SPA.
   a: ({ href, children }) => {
     const isExternal =
       typeof href === "string" && /^https?:\/\//i.test(href);
@@ -52,18 +57,9 @@ const MARKDOWN_COMPONENTS: Components = {
       </Link>
     );
   },
-
-  // Inline `code` spans get a monospace + subtle background treatment.
-  // Fenced code blocks (```...```) do NOT reach this renderer — they are
-  // intercepted upstream by `parseAssistantMessage` and rendered through
-  // `<PolicyViewer>` (which handles syntax highlighting and copy). If a
-  // fenced block ever DOES slip through, the default <pre><code> render
-  // is safe; it just won't be prettified.
   code: ({ children, className }) => {
     const isBlock = typeof className === "string" && className.startsWith("language-");
     if (isBlock) {
-      // Rare: a fenced block that parseAssistantMessage missed. Render
-      // as a plain preformatted block rather than as inline text.
       return (
         <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>
           <code className={className}>{children}</code>
@@ -78,18 +74,10 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-export default function MessageBubble({ message }: MessageBubbleProps) {
+export default function MessageBubble({ message, onFeedback }: MessageBubbleProps) {
   const isUser = message.role === "user";
 
-  // Cloudscape chat pattern: EVERY message renders in a <ChatBubble> with
-  // an <Avatar> as the authorship cue. The embedded pattern the AWS
-  // console uses for assistants inside an <AppLayout> content area is
-  // one-sided (all bubbles left-aligned); alternating left/right without
-  // avatars is a hybrid the pattern explicitly warns against (#167 Req 2).
   const avatar = isUser ? (
-    // Initials-based user avatars require the Cognito email or display
-    // name to be fetched at mount time. That plumbing is a small follow-up;
-    // for this PR the fallback icon avatar named by #167 Req 2.3 is used.
     <Avatar iconName="user-profile" tooltipText="You" ariaLabel="Your message" />
   ) : (
     <Avatar
@@ -100,28 +88,212 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
     />
   );
 
+  const showActions = !isUser && onFeedback !== undefined && message.content.trim().length > 0;
+
   return (
     <ChatBubble
       type={isUser ? "outgoing" : "incoming"}
       avatar={avatar}
       ariaLabel={isUser ? "Your message" : "Generative AI assistant response"}
+      actions={
+        showActions ? (
+          <ResponseActions message={message} onFeedback={onFeedback!} />
+        ) : undefined
+      }
     >
       {isUser ? (
-        // User content is plain text; render as a paragraph with preserved
-        // whitespace (so line breaks the user typed survive).
         <Box variant="p">
           <span style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>
             {message.content}
           </span>
         </Box>
       ) : (
-        // Assistant content is parsed into sections: text (markdown),
-        // policy documents (JSON), findings tables, dependency graphs.
-        // The section renderers are unchanged from the prior surface.
-        <AssistantSections message={message} />
+        <AssistantContent message={message} />
       )}
     </ChatBubble>
   );
+}
+
+function AssistantContent({ message }: { message: Message }) {
+  return (
+    <SpaceBetween size="s">
+      {message.toolsUsed && message.toolsUsed.length > 0 && (
+        <ThinkingSection
+          toolsUsed={message.toolsUsed}
+          durationSeconds={message.durationSeconds}
+        />
+      )}
+      <AssistantSections message={message} />
+    </SpaceBetween>
+  );
+}
+
+/**
+ * Cloudscape "Thinking pattern" disclosure — an inline ExpandableSection
+ * whose body is a Steps list, one step per tool the backend called on
+ * this turn. Collapsed by default; user opens it to inspect the trace.
+ *
+ * The backend is synchronous (POST /conversation returns everything at
+ * once, including tools_used), so all steps arrive completed and render
+ * with status="success". A live in-progress spinner during a turn would
+ * need backend streaming (Bedrock Converse with reasoning content); the
+ * spec explicitly defers that per DD-2.
+ */
+function ThinkingSection({
+  toolsUsed,
+  durationSeconds,
+}: {
+  toolsUsed: NonNullable<Message["toolsUsed"]>;
+  durationSeconds?: number;
+}) {
+  const headerText = thoughtHeaderText(toolsUsed.length, durationSeconds);
+  return (
+    <ExpandableSection variant="inline" headerText={headerText} defaultExpanded={false}>
+      <Steps
+        ariaLabel="Tools used to build this response"
+        steps={toolsUsed.map((t) => ({
+          status: "success" as const,
+          header: humanizeToolName(t.tool),
+          details: t.input_summary || undefined,
+        }))}
+      />
+    </ExpandableSection>
+  );
+}
+
+function thoughtHeaderText(count: number, durationSeconds?: number): string {
+  if (typeof durationSeconds === "number" && durationSeconds > 0) {
+    const noun = count === 1 ? "tool" : "tools";
+    return `Thought for ${durationSeconds}s — ${count} ${noun}`;
+  }
+  return `Used ${count} ${count === 1 ? "tool" : "tools"}`;
+}
+
+function humanizeToolName(tool: string): string {
+  // "list_findings" -> "List findings"
+  // "generate_action_plan" -> "Generate action plan"
+  const spaced = tool.replace(/_/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/**
+ * Inline actions rendered in the ChatBubble's `actions` footer slot per
+ * Cloudscape's gen-AI chat pattern:
+ *   * Helpful / Not helpful — icon-toggle-button with feedback popover.
+ *     Toggling either OFF returns feedback to "no vote". Setting one
+ *     while the other is on switches the vote (handled in the parent).
+ *   * Copy — copies the raw response text to the clipboard, with a
+ *     "Copied" popover confirmation.
+ *   * Save as .md — same download behavior as the pre-Cloudscape
+ *     surface; used to appear conditionally only for long responses,
+ *     now always visible so users don't have to guess the threshold.
+ */
+function ResponseActions({
+  message,
+  onFeedback,
+}: {
+  message: Message;
+  onFeedback: (feedback: "helpful" | "not-helpful") => void;
+}) {
+  const handleClick = ({ detail }: { detail: { id: string } }) => {
+    if (detail.id === "helpful") {
+      onFeedback("helpful");
+    } else if (detail.id === "not-helpful") {
+      onFeedback("not-helpful");
+    } else if (detail.id === "copy") {
+      void navigator.clipboard?.writeText(message.content);
+    } else if (detail.id === "save") {
+      void saveAsMarkdown(message.content);
+    }
+  };
+
+  return (
+    <ButtonGroup
+      ariaLabel="Response actions"
+      variant="icon"
+      onItemClick={handleClick}
+      items={[
+        {
+          type: "icon-toggle-button",
+          id: "helpful",
+          iconName: "thumbs-up",
+          pressedIconName: "thumbs-up-filled",
+          text: "Helpful",
+          pressed: message.feedback === "helpful",
+          popoverFeedback: (
+            <StatusIndicator type="success">Marked as helpful</StatusIndicator>
+          ),
+          pressedPopoverFeedback: (
+            <StatusIndicator type="info">Helpful vote cleared</StatusIndicator>
+          ),
+        },
+        {
+          type: "icon-toggle-button",
+          id: "not-helpful",
+          iconName: "thumbs-down",
+          pressedIconName: "thumbs-down-filled",
+          text: "Not helpful",
+          pressed: message.feedback === "not-helpful",
+          popoverFeedback: (
+            <StatusIndicator type="success">Marked as not helpful</StatusIndicator>
+          ),
+          pressedPopoverFeedback: (
+            <StatusIndicator type="info">Not-helpful vote cleared</StatusIndicator>
+          ),
+        },
+        {
+          type: "icon-button",
+          id: "copy",
+          iconName: "copy",
+          text: "Copy",
+          popoverFeedback: (
+            <StatusIndicator type="success">Copied to clipboard</StatusIndicator>
+          ),
+        },
+        {
+          type: "icon-button",
+          id: "save",
+          iconName: "download",
+          text: "Save as .md",
+        },
+      ]}
+    />
+  );
+}
+
+async function saveAsMarkdown(content: string) {
+  const filename = `iam-analysis-${new Date().toISOString().slice(0, 10)}.md`;
+  const blob = new Blob([content], { type: "text/markdown" });
+
+  // Prefer the File System Access API (proper Save As dialog) when the
+  // browser supports it and the request is served over a secure context.
+  const w = window as unknown as {
+    showSaveFilePicker?: (opts: unknown) => Promise<FileSystemFileHandle>;
+  };
+  if (typeof w.showSaveFilePicker === "function") {
+    try {
+      const handle = await w.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "Markdown", accept: { "text/markdown": [".md"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err: unknown) {
+      if ((err as Error).name === "AbortError") return;
+      // fall through to the blob-URL fallback
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function AssistantSections({ message }: { message: Message }) {
@@ -167,18 +339,6 @@ function AssistantSections({ message }: { message: Message }) {
                 >
                   {section.content}
                 </ReactMarkdown>
-                {section.content.length > 200 && (
-                  <div
-                    style={{
-                      marginTop: "8px",
-                      borderTop:
-                        "1px solid var(--color-border-divider-default)",
-                      paddingTop: "8px",
-                    }}
-                  >
-                    <DownloadButton content={message.content} />
-                  </div>
-                )}
               </div>
             );
         }
@@ -222,13 +382,11 @@ type MessageSection = TextSection | PolicySection | FindingsSection | Dependenci
 function parseAssistantMessage(content: string): MessageSection[] {
   const sections: MessageSection[] = [];
 
-  // Try to detect JSON code blocks with policy content
   const codeBlockRegex = /```(?:json|python|typescript)?\s*\n([\s\S]*?)\n```/g;
   let lastIndex = 0;
   let match;
 
   while ((match = codeBlockRegex.exec(content)) !== null) {
-    // Text before the code block
     if (match.index > lastIndex) {
       const textBefore = content.slice(lastIndex, match.index).trim();
       if (textBefore) {
@@ -249,7 +407,6 @@ function parseAssistantMessage(content: string): MessageSection[] {
         title: "IAM Policy",
       });
     } else {
-      // Generic code block — still render as policy viewer (syntax highlighted)
       sections.push({
         type: "policy",
         content: codeContent,
@@ -260,7 +417,6 @@ function parseAssistantMessage(content: string): MessageSection[] {
     lastIndex = match.index + match[0].length;
   }
 
-  // Remaining text after last code block
   if (lastIndex < content.length) {
     const remaining = content.slice(lastIndex).trim();
     if (remaining) {
@@ -268,7 +424,6 @@ function parseAssistantMessage(content: string): MessageSection[] {
     }
   }
 
-  // If no code blocks found, return as single text section
   if (sections.length === 0) {
     sections.push({ type: "text", content });
   }
@@ -285,50 +440,10 @@ function isPolicyDocument(content: string): boolean {
       (parsed.Type && parsed.Properties?.PolicyDocument)
     );
   } catch {
-    // Check for CDK patterns
     return (
       content.includes("iam.PolicyDocument(") ||
       content.includes("new iam.PolicyDocument(") ||
       content.includes("iam.PolicyStatement(")
     );
   }
-}
-
-function DownloadButton({ content }: { content: string }) {
-  const handleDownload = async () => {
-    const filename = `iam-analysis-${new Date().toISOString().slice(0, 10)}.md`;
-    const blob = new Blob([content], { type: "text/markdown" });
-
-    // Try modern File System Access API first (proper Save As dialog)
-    if ((window as unknown as { showSaveFilePicker?: unknown }).showSaveFilePicker) {
-      try {
-        const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
-          suggestedName: filename,
-          types: [{ description: "Markdown", accept: { "text/markdown": [".md"] } }],
-        });
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        return;
-      } catch (err: unknown) {
-        if ((err as Error).name === "AbortError") return;
-      }
-    }
-
-    // Fallback: blob URL with download attribute
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <Button iconName="download" variant="normal" onClick={handleDownload}>
-      Save as .md
-    </Button>
-  );
 }
