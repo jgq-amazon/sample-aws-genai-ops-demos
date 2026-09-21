@@ -5,6 +5,19 @@ export interface Message {
     inputTokens?: number;
     outputTokens?: number;
   };
+  /**
+   * When set to "error", the message is rendered as an inline Cloudscape
+   * `<Alert type="error">` inside the transcript at the position of the
+   * failed turn, instead of as a ChatBubble. Used for API errors,
+   * timeouts, and other request failures per #167 Req 7.
+   */
+  kind?: "error";
+  /**
+   * For error messages: the user prompt that triggered the failing
+   * request. Passed back through the Try again action so the message
+   * can be re-sent without the user re-typing it.
+   */
+  retryPrompt?: string;
 }
 
 /**

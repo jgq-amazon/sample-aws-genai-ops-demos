@@ -1,4 +1,5 @@
 import Box from "@cloudscape-design/components/box";
+import Alert from "@cloudscape-design/components/alert";
 import Button from "@cloudscape-design/components/button";
 import Link from "@cloudscape-design/components/link";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -14,6 +15,12 @@ import { Message, Finding, DependencyResult } from "../types";
 
 interface MessageBubbleProps {
   message: Message;
+  /**
+   * Called when the user clicks "Try again" on an error message. Only
+   * meaningful when `message.kind === "error"` and the parent supplied
+   * a `retryPrompt` — otherwise omit.
+   */
+  onRetry?: () => void;
 }
 
 /**
@@ -78,7 +85,30 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-export default function MessageBubble({ message }: MessageBubbleProps) {
+export default function MessageBubble({ message, onRetry }: MessageBubbleProps) {
+  // Error rendering per #167 Req 7: a failed turn is a single inline
+  // Cloudscape <Alert type="error"> at the position of the failure, with
+  // a Try again action wired to re-send the original user prompt through
+  // the parent's handleSend. This replaces the previous double-render
+  // (top-of-container Alert + assistant text bubble parroting the error).
+  if (message.kind === "error") {
+    return (
+      <Alert
+        type="error"
+        header="The request could not complete"
+        action={
+          onRetry ? (
+            <Button onClick={onRetry} variant="normal">
+              Try again
+            </Button>
+          ) : undefined
+        }
+      >
+        {message.content}
+      </Alert>
+    );
+  }
+
   const isUser = message.role === "user";
 
   // Cloudscape chat pattern: EVERY message renders in a <ChatBubble> with

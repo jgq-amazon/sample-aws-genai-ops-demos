@@ -4,11 +4,12 @@ import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Button from "@cloudscape-design/components/button";
 import Box from "@cloudscape-design/components/box";
-import Alert from "@cloudscape-design/components/alert";
 import FormField from "@cloudscape-design/components/form-field";
+import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import LiveRegion from "@cloudscape-design/components/live-region";
 import Popover from "@cloudscape-design/components/popover";
 import PromptInput from "@cloudscape-design/components/prompt-input";
+import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Avatar from "@cloudscape-design/chat-components/avatar";
 import ChatBubble from "@cloudscape-design/chat-components/chat-bubble";
@@ -24,13 +25,13 @@ import {
 import { Capabilities, CoverageEntry, Message } from "../types";
 
 const GREETING_BODY =
-  "Hello! I'm your **IAM Security Assistant**. I help you understand and fix your IAM roles and policies — unused roles, overly-permissive permissions, and cross-account access risks.\n\n" +
+  "This generative AI assistant helps you understand and fix your IAM roles and policies — unused roles, overly-permissive permissions, and cross-account access risks.\n\n" +
   "**Three capabilities that work independently or together:**\n\n" +
   "- **Analyze** — surface unused roles, excessive permissions, cross-account risks\n" +
   "- **Generate** — create least-privilege policies from actual usage\n" +
   "- **Protect** — validate changes, assess blast radius before you act\n\n" +
-  "Click a suggestion below to get started, or ask anything in your own words.\n\n" +
-  "*Tip: Anything I generate can be saved to S3 — just say \"export that\".*";
+  "Choose a suggested question, or ask anything in your own words.\n\n" +
+  "*Tip: anything generated here can be saved to S3 — just say \"export that\".*";
 
 // Read-only disclaimer moved to the composer's FormField constraintText per
 // Cloudscape's disclaimer pattern (Cloudscape gen-AI chat › "Under the prompt
@@ -83,12 +84,14 @@ const TIMEOUT_ADVICE =
   "Break it into smaller steps (for example, `show my active findings`, then `generate an action plan` on its own), " +
   "or ask for a narrower filter. Any export you were creating may still complete on the server — try `list my exports`.";
 
+const GENERIC_ERROR_PREAMBLE =
+  "The request could not complete";
+
 export default function ChatInterface() {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [messages, setMessages] = useState<Message[]>([buildWelcomeMessage(null)]);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [sessionActivity, setSessionActivity] = useState<ActivityEntry[]>([]);
   const [mode, setMode] = useState<AssistantMode>("guided");
   const [sessionTokens, setSessionTokens] = useState({ input: 0, output: 0 });
@@ -96,14 +99,30 @@ export default function ChatInterface() {
   // whenever this string changes — used to signal "Generating a response"
   // on request start and the plain-text response body on request end.
   const [liveAnnouncement, setLiveAnnouncement] = useState("");
+  // Whether the transcript is currently scrolled to the bottom. Auto-scroll
+  // to new messages ONLY when true, so a user reading older messages is not
+  // yanked back to the end (#167 Req 7.5).
+  const [isAtBottom, setIsAtBottom] = useState(true);
   // Use a ref so the current pagination cursor is read synchronously on the
   // next send, without a re-render round trip.
   const paginationRef = useRef<PaginationContext | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    if (isAtBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, isAtBottom]);
+
+  // Update `isAtBottom` from the scroll listener so `useEffect` above can
+  // decide whether new messages should pull the viewport. The tolerance
+  // absorbs sub-pixel scroll positions and browser rounding.
+  const handleTranscriptScroll: React.UIEventHandler<HTMLDivElement> = (e) => {
+    const el = e.currentTarget;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    setIsAtBottom(atBottom);
+  };
 
   // Session-start capability probe (#171 phase C). Best-effort: a failure
   // must NOT block the chat, so if the probe fails we leave capabilities
@@ -139,7 +158,6 @@ export default function ChatInterface() {
     setMessages((prev) => [...prev, userMessage]);
     setInputValue("");
     setIsLoading(true);
-    setError(null);
     // Announce request start to screen readers via the <LiveRegion>.
     setLiveAnnouncement("Generating a response");
 
@@ -202,13 +220,21 @@ export default function ChatInterface() {
       }
     } catch (err) {
       const isTimeout = err instanceof ApiTimeoutError;
-      const errorMsg = isTimeout ? TIMEOUT_ADVICE : err instanceof Error ? err.message : "Unknown error";
-      setError(errorMsg);
-      const assistantMessage: Message = {
+      const errorMsg = isTimeout
+        ? TIMEOUT_ADVICE
+        : `${GENERIC_ERROR_PREAMBLE}: ${err instanceof Error ? err.message : "Unknown error"}. Try again, or rephrase the question.`;
+      // Single-source error rendering per #167 Req 7: append one error
+      // message to the transcript at the failed turn's position. The
+      // previous double-render (top-of-container Alert + assistant text
+      // bubble) is gone — MessageBubble detects `kind: "error"` and
+      // renders a Cloudscape <Alert type="error" action=Try again>.
+      const errorMessage: Message = {
         role: "assistant",
-        content: isTimeout ? errorMsg : `I encountered an error: ${errorMsg}\n\nPlease try again or rephrase your question.`,
+        kind: "error",
+        content: errorMsg,
+        retryPrompt: messageToSend,
       };
-      setMessages((prev) => [...prev, assistantMessage]);
+      setMessages((prev) => [...prev, errorMessage]);
       setLiveAnnouncement(errorMsg);
     } finally {
       setIsLoading(false);
@@ -218,9 +244,22 @@ export default function ChatInterface() {
   const handleClear = () => {
     setMessages([buildWelcomeMessage(capabilities)]);
     setSessionActivity([]);
-    setError(null);
     paginationRef.current = null;
     setLiveAnnouncement("");
+    setIsAtBottom(true);
+  };
+
+  /**
+   * Called when the user clicks "Try again" on an error message in the
+   * transcript. Removes the error message from the list (so we don't
+   * pile up duplicate error alerts if the retry also fails) and
+   * re-sends the original user prompt through the normal handleSend
+   * path (which will append a fresh assistant response or a fresh
+   * error message as appropriate).
+   */
+  const handleRetry = (index: number, prompt: string) => {
+    setMessages((prev) => prev.filter((_, i) => i !== index));
+    void handleSend(prompt);
   };
 
   return (
@@ -228,14 +267,29 @@ export default function ChatInterface() {
       header={
         <Header
           variant="h2"
-          description="Ask questions about your IAM security posture"
+          description={
+            mode === "guided"
+              ? "Guided — detailed explanations, step-by-step recommendations"
+              : "Quick — concise answers, data-first"
+          }
           actions={
-            <Button
-              onClick={handleClear}
-              iconName="remove"
-              variant="icon"
-              ariaLabel="Clear conversation"
-            />
+            <SpaceBetween direction="horizontal" size="xs">
+              <SegmentedControl
+                selectedId={mode}
+                onChange={({ detail }) => setMode(detail.selectedId as AssistantMode)}
+                label="Response style"
+                options={[
+                  { id: "guided", text: "Guided" },
+                  { id: "quick", text: "Quick" },
+                ]}
+              />
+              <Button
+                onClick={handleClear}
+                iconName="remove"
+                variant="icon"
+                ariaLabel="Clear conversation"
+              />
+            </SpaceBetween>
           }
         >
           Conversation
@@ -243,41 +297,6 @@ export default function ChatInterface() {
       }
     >
       <SpaceBetween size="m">
-        {/* Mode toggle — PR 4 will replace this hand-rolled div with a
-            Cloudscape <SegmentedControl> in the Header actions slot. */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "8px 12px",
-            backgroundColor: "var(--color-background-layout-toggle-selected-default)",
-            borderRadius: "8px",
-            border: "1px solid var(--color-border-divider-default)",
-          }}
-        >
-          <span style={{ fontSize: "13px", color: "var(--color-text-body-secondary)" }}>
-            {mode === "guided"
-              ? "Guided Mode — detailed explanations, step-by-step recommendations, educational context"
-              : "Quick Mode — concise answers, data-first, no hand-holding"}
-          </span>
-          <Button
-            variant="inline-link"
-            onClick={() => setMode(mode === "guided" ? "quick" : "guided")}
-          >
-            Switch to {mode === "guided" ? "Quick" : "Guided"}
-          </Button>
-        </div>
-
-        {/* Error alert — PR 4 will consolidate this and the in-transcript
-            error bubble into a single inline <Alert> with a Try again
-            action, per #167 Req 7. */}
-        {error && (
-          <Alert type="error" dismissible onDismiss={() => setError(null)}>
-            {error}
-          </Alert>
-        )}
-
         {capabilities && <DataSourcesStatus capabilities={capabilities} />}
 
         {sessionActivity.length > 0 && (
@@ -290,6 +309,8 @@ export default function ChatInterface() {
         <div
           role="region"
           aria-label="Chat"
+          ref={transcriptRef}
+          onScroll={handleTranscriptScroll}
           style={{
             maxHeight: "60vh",
             overflowY: "auto",
@@ -299,7 +320,14 @@ export default function ChatInterface() {
           <SpaceBetween size="s">
             {messages.map((message, index) => (
               <ErrorBoundary key={index}>
-                <MessageBubble message={message} />
+                <MessageBubble
+                  message={message}
+                  onRetry={
+                    message.kind === "error" && message.retryPrompt
+                      ? () => handleRetry(index, message.retryPrompt!)
+                      : undefined
+                  }
+                />
               </ErrorBoundary>
             ))}
             {isLoading && <LoadingBubble />}
@@ -479,7 +507,19 @@ function DataSourcesStatus({ capabilities }: { capabilities: Capabilities }) {
   );
 }
 
-function SessionActivityBar({ activities, tokens }: { activities: ActivityEntry[]; tokens: { input: number; output: number } }) {
+/**
+ * Session stats rendered as a Cloudscape KeyValuePairs list instead of a
+ * hand-rolled colored div. Three columns: tool call breakdown, token
+ * counts, estimated cost. All theme tokens come from Cloudscape now (no
+ * more direct `var(--color-*)` reads).
+ */
+function SessionActivityBar({
+  activities,
+  tokens,
+}: {
+  activities: ActivityEntry[];
+  tokens: { input: number; output: number };
+}) {
   const toolCounts: Record<string, number> = {};
   for (const a of activities) {
     const name = a.tool.replace(/_/g, " ");
@@ -489,34 +529,35 @@ function SessionActivityBar({ activities, tokens }: { activities: ActivityEntry[
   // Approximate cost: Claude Sonnet input $3/MTok, output $15/MTok
   const estimatedCost = (tokens.input * 3 + tokens.output * 15) / 1_000_000;
   const costDisplay = estimatedCost < 0.01 ? "<$0.01" : `~$${estimatedCost.toFixed(3)}`;
+  const totalTokens = tokens.input + tokens.output;
+  const toolSummary = Object.entries(toolCounts)
+    .map(([name, count]) => `${name} (${count}×)`)
+    .join(", ") || "None";
+  const totalCalls = activities.length;
 
   return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        padding: "8px 12px",
-        backgroundColor: "var(--color-background-status-info)",
-        borderRadius: "8px",
-        border: "1px solid var(--color-border-status-info)",
-        fontSize: "12px",
-        color: "var(--color-text-status-info)",
-      }}
-    >
-      <span>
-        <strong>Session:</strong>{" "}
-        {Object.entries(toolCounts)
-          .map(([name, count]) => `${name} (${count}x)`)
-          .join(" | ")}
-        {" — "}
-        {activities.length} tool call{activities.length !== 1 ? "s" : ""}
-      </span>
-      <span style={{ opacity: 0.8 }}>
-        {tokens.input + tokens.output > 0 && (
-          <>Tokens: {(tokens.input + tokens.output).toLocaleString()} | Cost: {costDisplay}</>
-        )}
-      </span>
-    </div>
+    <Box padding="xs" variant="div">
+      <KeyValuePairs
+        columns={3}
+        items={[
+          {
+            label: `Tool calls (${totalCalls})`,
+            value: <Box variant="small">{toolSummary}</Box>,
+          },
+          {
+            label: "Tokens",
+            value: (
+              <Box variant="small">
+                {totalTokens > 0 ? totalTokens.toLocaleString() : "0"}
+              </Box>
+            ),
+          },
+          {
+            label: "Estimated cost",
+            value: <Box variant="small">{totalTokens > 0 ? costDisplay : "$0.00"}</Box>,
+          },
+        ]}
+      />
+    </Box>
   );
 }
