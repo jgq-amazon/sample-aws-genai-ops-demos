@@ -1,6 +1,10 @@
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import Link from "@cloudscape-design/components/link";
 import SpaceBetween from "@cloudscape-design/components/space-between";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import PolicyViewer from "./PolicyViewer";
 import FindingsTable from "./FindingsTable";
 import DependencyGraph from "./DependencyGraph";
@@ -9,6 +13,68 @@ import { Message, Finding, DependencyResult } from "../types";
 interface MessageBubbleProps {
   message: Message;
 }
+
+/**
+ * Custom renderers passed to `<ReactMarkdown>` so that markdown emitted by
+ * the model is themed via Cloudscape primitives instead of raw HTML with
+ * inline styles. Only the elements that differ from the browser default
+ * are overridden — headings, paragraphs, lists, emphasis, and line breaks
+ * inherit the Cloudscape global stylesheet and are left alone.
+ *
+ * SAFETY: this component tree is the ONLY path model output takes to the
+ * DOM (see #167 Req 1). We render through `<ReactMarkdown>` with the
+ * `rehypeSanitize` plugin using its default GitHub-derived schema, which
+ * strips `<script>`, `<style>`, `<iframe>`, `<object>`, `<embed>`, every
+ * `on*=` event handler, and any `javascript:` URL BEFORE this components
+ * table is ever consulted. `dangerouslySetInnerHTML` is never used
+ * anywhere in this file, so a malicious model turn (or a user turn the
+ * model reflects back) cannot inject executable HTML.
+ */
+const MARKDOWN_COMPONENTS: Components = {
+  // Links: external http(s) URLs open in a new tab with rel=noopener
+  // noreferrer (both to prevent reverse-tabnabbing and to keep referer
+  // headers off the third party). Non-http links (e.g. `#anchor`,
+  // `mailto:`) render as inline Cloudscape links that stay in the SPA.
+  a: ({ href, children }) => {
+    const isExternal =
+      typeof href === "string" && /^https?:\/\//i.test(href);
+    return (
+      <Link
+        href={href}
+        external={isExternal}
+        target={isExternal ? "_blank" : undefined}
+        rel={isExternal ? "noopener noreferrer" : undefined}
+        variant="primary"
+      >
+        {children}
+      </Link>
+    );
+  },
+
+  // Inline `code` spans get a monospace + subtle background treatment.
+  // Fenced code blocks (```...```) do NOT reach this renderer — they are
+  // intercepted upstream by `parseAssistantMessage` and rendered through
+  // `<PolicyViewer>` (which handles syntax highlighting and copy). If a
+  // fenced block ever DOES slip through, the default <pre><code> render
+  // is safe; it just won't be prettified.
+  code: ({ children, className }) => {
+    const isBlock = typeof className === "string" && className.startsWith("language-");
+    if (isBlock) {
+      // Rare: a fenced block that parseAssistantMessage missed. Render
+      // as a plain preformatted block rather than as inline text.
+      return (
+        <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>
+          <code className={className}>{children}</code>
+        </pre>
+      );
+    }
+    return (
+      <Box variant="code" display="inline">
+        {children}
+      </Box>
+    );
+  },
+};
 
 export default function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === "user";
@@ -77,14 +143,16 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
                       color: "var(--color-text-body-default)",
                       border: "1px solid var(--color-border-divider-default)",
                       position: "relative",
+                      lineHeight: 1.6,
                     }}
                   >
-                    <div
-                      style={{ whiteSpace: "pre-wrap", lineHeight: "1.6" }}
-                      dangerouslySetInnerHTML={{
-                        __html: formatMarkdown(section.content),
-                      }}
-                    />
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeSanitize]}
+                      components={MARKDOWN_COMPONENTS}
+                    >
+                      {section.content}
+                    </ReactMarkdown>
                     {section.content.length > 200 && (
                       <div style={{ marginTop: "8px", borderTop: "1px solid var(--color-border-divider-default)", paddingTop: "8px" }}>
                         <DownloadButton content={message.content} />
@@ -244,27 +312,4 @@ function DownloadButton({ content }: { content: string }) {
       Save as .md
     </Button>
   );
-}
-
-function formatMarkdown(content: string): string {
-  return content
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.*?)\*/g, "<em>$1</em>")
-    .replace(/`(.*?)`/g, '<code style="background:var(--color-background-code-editor-gutter-default, #2a2d35);color:var(--color-text-code-editor-plain-text, #e0e0e0);padding:2px 6px;border-radius:4px;font-size:12px;font-family:monospace;">$1</code>')
-    // Lenient: the closing ')' is optional and the URL runs to the next space.
-    // Long presigned URLs sometimes arrive without the closing paren (truncated
-    // mid-line); the strict form left those as raw text. This still renders a
-    // clean link using the label, hiding the URL.
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)?/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:var(--color-text-link-default);word-break:break-all;">$1</a>')
-    // Auto-linkify bare URLs (e.g. presigned S3 download links) that the model
-    // emitted without markdown link syntax. The lookbehind skips URLs already
-    // inside an anchor (href="…), a markdown link '(…', or after '>' so we never
-    // double-wrap the links handled by the rule above.
-    .replace(/(?<!["=(])(https?:\/\/[^\s<>()[\]]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:var(--color-text-link-default);word-break:break-all;">$1</a>')
-    .replace(/^### (.*$)/gm, '<h4 style="margin:8px 0 4px;">$1</h4>')
-    .replace(/^## (.*$)/gm, '<h3 style="margin:12px 0 4px;">$1</h3>')
-    .replace(/^- (.*$)/gm, '<li style="margin:2px 0;">$1</li>')
-    .replace(/(<li.*<\/li>\n?)+/g, '<ul style="margin:4px 0;padding-left:20px;">$&</ul>')
-    .replace(/\n\n/g, '<br/><br/>')
-    .replace(/\n/g, '<br/>');
 }
